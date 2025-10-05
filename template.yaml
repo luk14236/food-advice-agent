@@ -8,35 +8,35 @@ Globals:
     Timeout: 15
     MemorySize: 512
     Tracing: Active
-    Environment:
-      Variables:
-        OPENAI_API_BASE: "https://api.openai.com/v1"
-        OPENAI_MODEL_ANSWER: "gpt-4o-mini"
-        OPENAI_MODEL_PARSE: "gpt-4o-mini"
-        POWERTOOLS_SERVICE_NAME: "favorite-foods-bots"
-        LOG_LEVEL: "INFO"
-
+  Api:
+    Cors:
+      AllowMethods: "'OPTIONS,DELETE,PUT,POST'"
+      AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+      AllowOrigin: "'*'"
 Parameters:
   OpenAIKeyParam:
     Type: String
     NoEcho: true
     Description: OpenAI API key
 
+
 Resources:
-  Api:
+  ApiGatewayApi:
     Type: AWS::Serverless::Api
     Properties:
       StageName: prod
-      TracingEnabled: true
-      Cors:
-        AllowOrigin: "'*'"
-        AllowHeaders: "'Content-Type,Authorization'"
-        AllowMethods: "'OPTIONS,POST,GET'"
-      MethodSettings:
-        - ResourcePath: "/*"
-          HttpMethod: "*"
-          ThrottlingBurstLimit: 100
-          ThrottlingRateLimit: 50
+      Auth:
+        ApiKeyRequired: true
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          Description: !Join [ " ", [ { "Ref": "AWS::StackName" }, "usage plan" ] ]
+          Quota:
+            Limit: 100000
+            Period: DAY
+          Throttle:
+            BurstLimit: 1000
+            RateLimit: 100
+          UsagePlanName: !Join [ "", [ { "Ref": "AWS::StackName" }, "-usage-plan" ] ]
 
   AnswerBotFunction:
     Type: AWS::Serverless::Function
@@ -50,12 +50,12 @@ Resources:
         PostAnswer:
           Type: Api
           Properties:
-            RestApiId: !Ref Api
             Path: /answer
             Method: POST
-      AutoPublishAlias: live
-      ProvisionedConcurrencyConfig:
-        ProvisionedConcurrentExecutions: 1
+            RestApiId:
+              Ref: ApiGatewayApi
+            Auth:
+              ApiKeyRequired: true
 
   AskBotFunction:
     Type: AWS::Serverless::Function
@@ -69,39 +69,28 @@ Resources:
         PostAsk:
           Type: Api
           Properties:
-            RestApiId: !Ref Api
             Path: /ask
             Method: POST
-      AutoPublishAlias: live
-      ProvisionedConcurrencyConfig:
-        ProvisionedConcurrentExecutions: 1
+            RestApiId:
+              Ref: ApiGatewayApi
+            Auth:
+              ApiKeyRequired: true
 
   OrchestratorFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: lambdas/orchestrator/
       Handler: app.handler
-      Environment:
-        Variables:
-          OPENAI_API_KEY: !Ref OpenAIKeyParam
-          ANSWER_URL: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod/answer"
-          ASK_URL: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod/ask"
-      Policies:
-        - Statement:
-            - Effect: Allow
-              Action:
-                - execute-api:Invoke
-              Resource: "*"
       Events:
         PostSimulate:
           Type: Api
           Properties:
-            RestApiId: !Ref Api
             Path: /simulate
             Method: POST
-      AutoPublishAlias: live
-      ProvisionedConcurrencyConfig:
-        ProvisionedConcurrentExecutions: 1
+            RestApiId:
+              Ref: ApiGatewayApi
+            Auth:
+              ApiKeyRequired: true
 
 Outputs:
   ApiEndpoint:

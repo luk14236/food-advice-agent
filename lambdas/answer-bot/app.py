@@ -8,12 +8,10 @@ LOG = logging.getLogger(__name__)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-SYSTEM = """You are AnswerBot. You read a question about favorite foods and reply ONLY with a list of exactly three dish names (world cuisines), optionally with 1 short descriptive clause for each. Avoid drinks. No commentary."""
-USER_HINT = """Examples of valid outputs:
-- "Feijoada — Brazilian stew; Sushi — assorted nigiri and maki; Bibimbap — Korean rice bowl"
-- "Biryani; Paella; Moussaka"
-Strictly three distinct dishes, preferably from different regions.
-"""
+SYSTEM = """You are AnswerBot.
+Return exactly three distinct world dishes (no drinks). Prefer different regions each time.
+Vary your choices across calls; avoid commonly overused examples like Sushi, Pizza, Pasta, Biryani, Paella, Moussaka, Feijoada, Bibimbap.
+Reply as plain text with dishes separated by semicolons. No commentary."""
 
 def get_response(messages):
 
@@ -29,11 +27,11 @@ def get_response(messages):
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages = json.loads(json.dumps(general_messages)),
-        max_tokens=300,
+        max_tokens=120,
         n=1,
         stop=None,
-        top_p = 1,
-        temperature=0
+        top_p = 0.95,
+        temperature=0.8
     )
 
     return response.choices[0].message.content
@@ -49,18 +47,13 @@ def handler(event, context):
             {"role": "user", "content": question}
         ])
 
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            data = {"error": "Parser failed to produce valid JSON", "raw": content}
-
         return {
             "statusCode": 200,
             "headers": {
                 "Content-Type": "application/json",
                 "Access-Control-Allow-Origin": "*"
             },
-            "body": json.dumps(data)
+            "body": json.dumps(content)
         }
     except Exception as e:
         LOG.exception("ask-bot error")

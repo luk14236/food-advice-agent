@@ -13,8 +13,8 @@ Return exactly three distinct world dishes (no drinks). Prefer different regions
 Vary your choices across calls; avoid commonly overused examples like Sushi, Pizza, Pasta, Biryani, Paella, Moussaka, Feijoada, Bibimbap.
 Reply as plain text with dishes separated by semicolons. No commentary."""
 
-def get_response(messages):
 
+def get_response(messages):
     general_messages = [
         {
             "role": "system",
@@ -26,11 +26,11 @@ def get_response(messages):
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages = json.loads(json.dumps(general_messages)),
+        messages=json.loads(json.dumps(general_messages)),
         max_tokens=120,
         n=1,
         stop=None,
-        top_p = 0.95,
+        top_p=0.95,
         temperature=0.8
     )
 

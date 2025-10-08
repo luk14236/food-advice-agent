@@ -8,7 +8,6 @@ LOG = logging.getLogger(__name__)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-
 SYSTEM = """You are AskBot, a strict parser for favorite foods.
 Input: a short free-text list of dishes.
 Task:
@@ -34,8 +33,8 @@ Return this shape:
 }
 """
 
-def get_response(messages):
 
+def get_response(messages):
     general_messages = [
         {
             "role": "system",
@@ -47,12 +46,12 @@ def get_response(messages):
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages = json.loads(json.dumps(general_messages)),
+        messages=json.loads(json.dumps(general_messages)),
         response_format={"type": "json_object"},
         max_tokens=300,
         n=1,
         stop=None,
-        top_p = 1,
+        top_p=1,
         temperature=0
     )
 

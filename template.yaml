@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Two-bot favorite-foods system (AnswerBot + AskBot) with API Gateway and an Orchestrator.
+Description: Two-bot favorite-foods system (AnswerBot + AskBot) with API Gateway, Orchestrator, and RDS Postgres (no seed, no migrations).
 
 Globals:
   Function:
@@ -13,12 +13,44 @@ Globals:
       AllowMethods: "'OPTIONS,DELETE,PUT,POST'"
       AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
       AllowOrigin: "'*'"
+
 Parameters:
   OpenAIKeyParam:
     Type: String
     NoEcho: true
     Description: OpenAI API key
 
+  # VPC / Networking
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC Id where RDS and Lambdas will run
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets for RDS and Lambdas (at least 2 for RDS)
+
+  # RDS
+  DBName:
+    Type: String
+    Default: appdb
+    Description: Postgres database name
+  DBUsername:
+    Type: String
+    Default: appuser
+    Description: Postgres master username
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Postgres master password (use Secrets Manager in prod)
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    AllowedPattern: "db\\..+"
+    Description: RDS instance class
+  AllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    Description: RDS storage (GiB)
 
 Resources:
   ApiGatewayApi:
@@ -38,6 +70,52 @@ Resources:
             RateLimit: 100
           UsagePlanName: !Join [ "", [ { "Ref": "AWS::StackName" }, "-usage-plan" ] ]
 
+  # --- Networking SG/Subnet Group ---
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Lambda egress to RDS
+      VpcId: !Ref VpcId
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Postgres 5432 from Lambdas
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Postgres
+      SubnetIds: !Ref PrivateSubnetIds
+
+  # --- RDS Postgres ---
+  PostgresDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: postgres
+      EngineVersion: "16.3"
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref AllocatedStorage
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBName: !Ref DBName
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      DeletionProtection: false
+      BackupRetentionPeriod: 1
+      MultiAZ: false
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+
+  # --- AnswerBot (generator) ---
   AnswerBotFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -52,11 +130,11 @@ Resources:
           Properties:
             Path: /answer
             Method: POST
-            RestApiId:
-              Ref: ApiGatewayApi
+            RestApiId: !Ref ApiGatewayApi
             Auth:
               ApiKeyRequired: true
 
+  # --- AskBot (parser) ---
   AskBotFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -71,23 +149,52 @@ Resources:
           Properties:
             Path: /ask
             Method: POST
-            RestApiId:
-              Ref: ApiGatewayApi
+            RestApiId: !Ref ApiGatewayApi
             Auth:
               ApiKeyRequired: true
 
+  # --- Orchestrator ---
   OrchestratorFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: lambdas/orchestrator/
       Handler: app.handler
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref PrivateSubnetIds
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AnswerBotFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AskBotFunction
+        - AWSLambdaVPCAccessExecutionRole
+      Environment:
+        Variables:
+          LAMBDA_GENERATOR_NAME: !Ref AnswerBotFunction
+          LAMBDA_PARSER_NAME: !Ref AskBotFunction
+          PG_HOST: !GetAtt PostgresDB.Endpoint.Address
+          PG_PORT: !GetAtt PostgresDB.Endpoint.Port
+          PG_DB: !Ref DBName
+          PG_USER: !Ref DBUsername
+          PG_PASSWORD: !Ref DBPassword
       Events:
         PostSimulate:
           Type: Api
           Properties:
             Path: /simulate
             Method: POST
-            RestApiId:
-              Ref: ApiGatewayApi
+            RestApiId: !Ref ApiGatewayApi
             Auth:
               ApiKeyRequired: true
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${ApiGatewayApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Description: API base URL
+  RdsEndpoint:
+    Value: !GetAtt PostgresDB.Endpoint.Address
+    Description: RDS Postgres endpoint
+  OrchestratorName:
+    Value: !Ref OrchestratorFunction
+    Description: Orchestrator Lambda name

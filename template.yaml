@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Two-bot favorite-foods system (AnswerBot + AskBot) with API Gateway, Orchestrator, and RDS Postgres (no seed, no migrations).
+Description: Two-bot favorite-foods with API Gateway, Orchestrator in existing VPC, RDS Postgres, Secrets Manager, and VPC Endpoints (no NAT).
 
 Globals:
   Function:
@@ -20,39 +20,34 @@ Parameters:
     NoEcho: true
     Description: OpenAI API key
 
-  # VPC / Networking
+  # Use recursos EXISTENTES
   VpcId:
     Type: AWS::EC2::VPC::Id
-    Description: Existing VPC Id where RDS and Lambdas will run
+    Description: Existing VPC Id (e.g., vpc-0a6481a4c2979705a)
   PrivateSubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
-    Description: Private subnets for RDS and Lambdas (at least 2 for RDS)
+    Description: Two or more PRIVATE subnet IDs in this VPC (comma-separated)
 
   # RDS
   DBName:
     Type: String
     Default: appdb
-    Description: Postgres database name
   DBUsername:
     Type: String
     Default: appuser
-    Description: Postgres master username
-  DBPassword:
-    Type: String
-    NoEcho: true
-    Description: Postgres master password (use Secrets Manager in prod)
   DBInstanceClass:
     Type: String
     Default: db.t4g.micro
     AllowedPattern: "db\\..+"
-    Description: RDS instance class
   AllocatedStorage:
     Type: Number
     Default: 20
     MinValue: 20
-    Description: RDS storage (GiB)
 
 Resources:
+  ################################
+  # API Gateway (público)
+  ################################
   ApiGatewayApi:
     Type: AWS::Serverless::Api
     Properties:
@@ -70,11 +65,13 @@ Resources:
             RateLimit: 100
           UsagePlanName: !Join [ "", [ { "Ref": "AWS::StackName" }, "-usage-plan" ] ]
 
-  # --- Networking SG/Subnet Group ---
+  ################################
+  # Security Groups + SubnetGroup
+  ################################
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow Lambda egress to RDS
+      GroupDescription: Allow Lambda egress to RDS/VPC endpoints
       VpcId: !Ref VpcId
 
   RDSSecurityGroup:
@@ -91,10 +88,27 @@ Resources:
   DBSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
-      DBSubnetGroupDescription: Subnet group for Postgres
+      DBSubnetGroupDescription: Existing VPC private subnets for Postgres
       SubnetIds: !Ref PrivateSubnetIds
 
-  # --- RDS Postgres ---
+  ################################
+  # Secrets Manager (senha gerada)
+  ################################
+  DBPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Master credentials for the Postgres RDS
+      GenerateSecretString:
+        SecretStringTemplate: !Sub |
+          {"username":"${DBUsername}"}
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"\/@`'
+        RequireEachIncludedType: true
+
+  ################################
+  # RDS Postgres (privado)
+  ################################
   PostgresDB:
     Type: AWS::RDS::DBInstance
     Properties:
@@ -103,7 +117,7 @@ Resources:
       DBInstanceClass: !Ref DBInstanceClass
       AllocatedStorage: !Ref AllocatedStorage
       MasterUsername: !Ref DBUsername
-      MasterUserPassword: !Ref DBPassword
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBPasswordSecret}:SecretString:password}}'
       DBName: !Ref DBName
       PubliclyAccessible: false
       VPCSecurityGroups:
@@ -115,7 +129,52 @@ Resources:
     DeletionPolicy: Snapshot
     UpdateReplacePolicy: Snapshot
 
-  # --- AnswerBot (generator) ---
+  ################################
+  # VPC Endpoints (sem NAT)
+  ################################
+  VPCEndpointLambda:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.lambda"
+      VpcEndpointType: Interface
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds: [ !Ref LambdaSecurityGroup ]
+      PrivateDnsEnabled: true
+
+  VPCEndpointSecretsManager:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
+      VpcEndpointType: Interface
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds: [ !Ref LambdaSecurityGroup ]
+      PrivateDnsEnabled: true
+
+  VPCEndpointLogs:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      VpcEndpointType: Interface
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds: [ !Ref LambdaSecurityGroup ]
+      PrivateDnsEnabled: true
+
+  VPCEndpointKMS:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.kms"
+      VpcEndpointType: Interface
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds: [ !Ref LambdaSecurityGroup ]
+      PrivateDnsEnabled: true
+
+  ################################
+  # Lambdas públicas (sem VPC)
+  ################################
   AnswerBotFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -134,7 +193,6 @@ Resources:
             Auth:
               ApiKeyRequired: true
 
-  # --- AskBot (parser) ---
   AskBotFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -153,7 +211,9 @@ Resources:
             Auth:
               ApiKeyRequired: true
 
-  # --- Orchestrator ---
+  ################################
+  # Orchestrator (na VPC privada)
+  ################################
   OrchestratorFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -169,6 +229,11 @@ Resources:
         - LambdaInvokePolicy:
             FunctionName: !Ref AskBotFunction
         - AWSLambdaVPCAccessExecutionRole
+        - Statement:
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Ref DBPasswordSecret
       Environment:
         Variables:
           LAMBDA_GENERATOR_NAME: !Ref AnswerBotFunction
@@ -176,8 +241,7 @@ Resources:
           PG_HOST: !GetAtt PostgresDB.Endpoint.Address
           PG_PORT: !GetAtt PostgresDB.Endpoint.Port
           PG_DB: !Ref DBName
-          PG_USER: !Ref DBUsername
-          PG_PASSWORD: !Ref DBPassword
+          PG_SECRET_ARN: !Ref DBPasswordSecret
       Events:
         PostSimulate:
           Type: Api

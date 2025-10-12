@@ -1,7 +1,7 @@
 import os
 import json
-import uuid
 import logging
+from uuid import uuid4
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
@@ -19,13 +19,11 @@ LOG = logging.getLogger(__name__)
 LAMBDA_GENERATOR_NAME = os.getenv("LAMBDA_GENERATOR_NAME")  # e.g., "answerbot-generator"
 LAMBDA_PARSER_NAME = os.getenv("LAMBDA_PARSER_NAME")        # e.g., "answerbot-parser"
 
-# Postgres connection (host/port/db) + secret for credentials
-PG_HOST = os.getenv("PG_HOST")
-PG_PORT = int(os.getenv("PG_PORT", "5432"))
-PG_DB = os.getenv("PG_DB")
-PG_SECRET_ARN = os.getenv("PG_SECRET_ARN")                  # Secrets Manager ARN with {"username","password"}
+# Secrets (use Secrets Manager ONLY; no PG_HOST/PG_DB envs)
+PG_PASSWORD_SECRET_ARN = os.getenv("PG_PASSWORD_SECRET_ARN")  # {"username","password"}
+PG_CONN_SECRET_ARN = os.getenv("PG_CONN_SECRET_ARN")          # {"host","port","dbname","username"}
 
-# Optional: default question to pass to the generator
+# Optional: default question for the generator
 DEFAULT_QUESTION = os.getenv("DEFAULT_QUESTION", "Tell me your three favorite foods.")
 
 # Reuse clients; add small retries for transient AWS API hiccups
@@ -51,7 +49,7 @@ def _invoke_lambda(function_name: str, payload: Dict[str, Any]) -> Any:
             InvocationType="RequestResponse",
             Payload=json.dumps(payload).encode("utf-8"),
         )
-    except ClientError as e:
+    except ClientError:
         LOG.exception("Failed to invoke lambda %s", function_name)
         raise
 
@@ -69,7 +67,7 @@ def _invoke_lambda(function_name: str, payload: Dict[str, Any]) -> Any:
         LOG.error("Lambda %s returned error %s: %s", function_name, status, body)
         raise RuntimeError(f"Lambda {function_name} error: {status} {body}")
 
-    # 'body' can be a JSON string or plain text
+    # 'body' might be a JSON string or a plain string.
     if isinstance(body, str):
         try:
             return json.loads(body)
@@ -86,7 +84,7 @@ def _get_generator_answer(question: str) -> str:
     event = {"body": json.dumps({"question": question})}
     body = _invoke_lambda(LAMBDA_GENERATOR_NAME, event)
     if not isinstance(body, str):
-        # Force to string to tolerate future changes
+        # Force to string just in case the generator changes behavior.
         body = json.dumps(body, ensure_ascii=False)
     return body.strip()
 
@@ -94,9 +92,9 @@ def _get_generator_answer(question: str) -> str:
 def _parse_answer(answer_text: str) -> Dict[str, Any]:
     """
     Call the parser lambda with {"answer": "..."}.
-    Returns a dict:
+    Returns a dict of the form:
       {"favorite_foods": [{"name": "...","possible_ingredients":[...],"diet":"..."} * 3]}
-    Validates the expected shape.
+    Raises if the format is not as expected.
     """
     event = {"body": json.dumps({"answer": answer_text})}
     body = _invoke_lambda(LAMBDA_PARSER_NAME, event)
@@ -109,47 +107,65 @@ def _parse_answer(answer_text: str) -> Dict[str, Any]:
 
     foods = body.get("favorite_foods")
     if not isinstance(foods, list):
-        raise RuntimeError(f"Unexpected parser format (missing list): {body}")
+        raise RuntimeError(f"Unexpected parser format: {body}")
     if len(foods) != 3:
         raise RuntimeError(f"Parser returned {len(foods)} items (expected 3): {foods}")
-
     return body
 
 
 # --------------------------
 # Helpers: Secrets & Postgres
 # --------------------------
-def _get_db_creds() -> Tuple[str, str]:
+def _get_password_creds() -> Tuple[str, str]:
     """
-    Read {"username": "...", "password": "..."} from Secrets Manager.
+    Read {"username": "...", "password": "..."} from PG_PASSWORD_SECRET_ARN.
     """
-    if not PG_SECRET_ARN:
-        raise RuntimeError("PG_SECRET_ARN is not set.")
+    if not PG_PASSWORD_SECRET_ARN:
+        raise RuntimeError("PG_PASSWORD_SECRET_ARN is not set.")
     try:
-        resp = secrets_client.get_secret_value(SecretId=PG_SECRET_ARN)
+        resp = secrets_client.get_secret_value(SecretId=PG_PASSWORD_SECRET_ARN)
     except ClientError:
-        LOG.exception("Failed to read secret %s", PG_SECRET_ARN)
+        LOG.exception("Failed to read secret %s", PG_PASSWORD_SECRET_ARN)
         raise
+    data = json.loads(resp.get("SecretString") or "{}")
+    missing = [k for k in ("username", "password") if k not in data]
+    if missing:
+        raise RuntimeError(f"Password secret missing keys: {missing}")
+    return data["username"], data["password"]
 
-    blob = resp.get("SecretString") or "{}"
-    data = json.loads(blob)
+
+def _get_conn_info() -> Dict[str, Any]:
+    """
+    Read {"host": "...", "port": 5432, "dbname": "...", "username": "..."} from PG_CONN_SECRET_ARN.
+    """
+    if not PG_CONN_SECRET_ARN:
+        raise RuntimeError("PG_CONN_SECRET_ARN is not set.")
     try:
-        return data["username"], data["password"]
-    except KeyError:
-        raise RuntimeError(f"Secret {PG_SECRET_ARN} missing username/password keys")
+        resp = secrets_client.get_secret_value(SecretId=PG_CONN_SECRET_ARN)
+    except ClientError:
+        LOG.exception("Failed to read secret %s", PG_CONN_SECRET_ARN)
+        raise
+    data = json.loads(resp.get("SecretString") or "{}")
+    missing = [k for k in ("host", "port", "dbname", "username") if k not in data]
+    if missing:
+        raise RuntimeError(f"Connection secret missing keys: {missing}")
+    return data
 
 
 def _connect_pg():
     """
-    Open a Postgres connection using host/port/db and creds from Secrets Manager.
+    Open a Postgres connection using ONLY Secrets Manager (no PG_* env vars).
     """
-    if not (PG_HOST and PG_DB):
-        raise RuntimeError("PG_HOST and PG_DB must be set via environment variables.")
-    user, password = _get_db_creds()
+    conn_info = _get_conn_info()
+    user_from_pwd, password = _get_password_creds()
+
+    # Optional sanity: prefer the username from password secret.
+    user = user_from_pwd
+
     return psycopg2.connect(
-        host=PG_HOST,
-        port=PG_PORT,
-        dbname=PG_DB,
+        host=conn_info["host"],
+        port=int(conn_info["port"]),
+        dbname=conn_info["dbname"],
         user=user,
         password=password,
         connect_timeout=10,
@@ -158,14 +174,14 @@ def _connect_pg():
 
 def _insert_batch(conn, rows: List[Tuple[Any, ...]]) -> None:
     """
-    Bulk insert rows into the 'favorite_foods' table.
-
-    rows: list of tuples
-      (run_id, dish_index, name, possible_ingredients(list), diet, source_text, created_at)
+    Bulk insert rows into the 'favorite_foods' table with user linkage.
+    rows: list of tuples -> (user_id, name, possible_ingredients(list), diet, created_at)
     """
+    if not rows:
+        return
     sql = """
     INSERT INTO favorite_foods
-      (run_id, dish_index, name, possible_ingredients, diet, source_text, created_at)
+      (user_id, name, possible_ingredients, diet, created_at)
     VALUES %s
     """
     with conn.cursor() as cur:
@@ -178,26 +194,28 @@ def _insert_batch(conn, rows: List[Tuple[Any, ...]]) -> None:
 # ---------------
 def handler(event, context):
     """
-    Orchestrator entry point.
-
-    Expected event:
-    {
-      "runs": 100,                   # number of iterations (required, >0)
-      "question": "optional override of the default question",
-      "store_source_text": true      # optional (default True) - whether to store raw generator text
-    }
-
-    Behavior per run:
-      1) Invoke the generator (plain text with 3 dishes)
-      2) Invoke the parser (structured JSON with exactly 3 items)
-      3) Insert 3 rows into Postgres
-
-    All rows in this invocation share the same 'run_id' (UUID).
+    Accepts:
+    - API Gateway proxy: event["body"] is a JSON string like '{"runs":10}'
+    - Direct invoke / tests: event is already a dict like {"runs":10}
     """
     try:
         LOG.info("Orchestrator start")
-        body = event if isinstance(event, dict) else {}
-        runs = int(body.get("runs") or 0)
+
+        # Robust body parsing
+        raw = {}
+        if isinstance(event, dict):
+            if "body" in event:
+                b = event.get("body")
+                if isinstance(b, str):
+                    raw = json.loads(b or "{}")
+                elif isinstance(b, dict):
+                    raw = b
+            else:
+                raw = event
+        else:
+            raw = {}
+
+        runs = int(raw.get("runs") or 0)
         if runs <= 0:
             return {
                 "statusCode": 400,
@@ -205,14 +223,12 @@ def handler(event, context):
                 "body": json.dumps({"error": "Missing or invalid 'runs' (>0)"}),
             }
 
-        question = body.get("question") or DEFAULT_QUESTION
-        store_source_text = body.get("store_source_text", True)
+        question = raw.get("question") or DEFAULT_QUESTION
 
         conn = _connect_pg()
 
         total_inserted = 0
         pending_rows: List[Tuple[Any, ...]] = []
-        run_uuid = uuid.uuid4()
         now = datetime.now(timezone.utc)
 
         for i in range(runs):
@@ -224,24 +240,14 @@ def handler(event, context):
             parsed = _parse_answer(answer_text)
             foods = parsed["favorite_foods"]
 
-            # 3) Accumulate rows for batch insert
-            for idx, f in enumerate(foods):
+            # 3) One user_id per iteration (3 rows per user)
+            user_id = str(uuid4())
+
+            for f in foods:
                 name = (f.get("name") or "").strip()
                 ingredients = f.get("possible_ingredients", []) or []
                 diet = f.get("diet", "normal")
-                source_text = answer_text if store_source_text else None
-
-                pending_rows.append(
-                    (
-                        str(run_uuid),  # same run_id for this whole invocation
-                        idx,            # 0..2
-                        name,
-                        ingredients,    # psycopg2 converts list -> text[]
-                        diet,
-                        source_text,
-                        now,
-                    )
-                )
+                pending_rows.append((user_id, name, ingredients, diet, now))
                 total_inserted += 1
 
             # Flush every 10 runs (3*10 = 30 rows) to keep transactions reasonable
@@ -258,9 +264,7 @@ def handler(event, context):
         return {
             "statusCode": 200,
             "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"},
-            "body": json.dumps(
-                {"ok": True, "runs": runs, "inserted_rows": total_inserted, "run_id": str(run_uuid)}
-            ),
+            "body": json.dumps({"ok": True, "runs": runs, "inserted_rows": total_inserted}),
         }
 
     except Exception as e:

@@ -5,8 +5,8 @@ Description: Two-bot favorite-foods with API Gateway, Orchestrator in existing V
 Globals:
   Function:
     Runtime: python3.12
-    Timeout: 15
-    MemorySize: 512
+    Timeout: 900
+    MemorySize: 1024
     Tracing: Active
   Api:
     Cors:
@@ -20,7 +20,6 @@ Parameters:
     NoEcho: true
     Description: OpenAI API key
 
-  # Use recursos EXISTENTES
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: Existing VPC Id (e.g., vpc-0a6481a4c2979705a)
@@ -28,7 +27,6 @@ Parameters:
     Type: List<AWS::EC2::Subnet::Id>
     Description: Two or more PRIVATE subnet IDs in this VPC (comma-separated)
 
-  # RDS
   DBName:
     Type: String
     Default: appdb
@@ -45,9 +43,6 @@ Parameters:
     MinValue: 20
 
 Resources:
-  ################################
-  # API Gateway (público)
-  ################################
   ApiGatewayApi:
     Type: AWS::Serverless::Api
     Properties:
@@ -65,9 +60,6 @@ Resources:
             RateLimit: 100
           UsagePlanName: !Join [ "", [ { "Ref": "AWS::StackName" }, "-usage-plan" ] ]
 
-  ################################
-  # Security Groups + SubnetGroup
-  ################################
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -77,7 +69,7 @@ Resources:
   RDSSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow Postgres 5432 from Lambdas
+      GroupDescription: Allow Postgres 5432 from Lambdas and PoC any IP
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -93,19 +85,28 @@ Resources:
           ToPort: 5432
           CidrIpv6: ::/0
 
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS from Lambda to VPC Endpoints
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
   DBSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
       DBSubnetGroupDescription: Existing VPC private subnets for Postgres
       SubnetIds: !Ref PrivateSubnetIds
 
-  ################################
-  # Secrets Manager (senha gerada)
-  ################################
+  # Secret now ONLY carries username+password (NO ref to DB endpoint to avoid cycles)
   DBPasswordSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Description: Master credentials for the Postgres RDS
+      Description: Master credentials for the Postgres RDS (username+password only)
       GenerateSecretString:
         SecretStringTemplate: !Sub |
           {"username":"${DBUsername}"}
@@ -114,9 +115,18 @@ Resources:
         ExcludeCharacters: '"\/@`'
         RequireEachIncludedType: true
 
-  ################################
-  # RDS Postgres (privado)
-  ################################
+  DBConnSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Connection info for the Postgres RDS (host/port/dbname/username)
+      SecretString: !Sub |
+        {
+          "host": "${PostgresDB.Endpoint.Address}",
+          "port": "${PostgresDB.Endpoint.Port}",
+          "dbname": "${DBName}",
+          "username": "${DBUsername}"
+        }
+
   PostgresDB:
     Type: AWS::RDS::DBInstance
     Properties:
@@ -134,12 +144,7 @@ Resources:
       DeletionProtection: false
       BackupRetentionPeriod: 1
       MultiAZ: false
-    DeletionPolicy: Snapshot
-    UpdateReplacePolicy: Snapshot
 
-  ################################
-  # VPC Endpoints (sem NAT)
-  ################################
   VPCEndpointLambda:
     Type: AWS::EC2::VPCEndpoint
     Properties:
@@ -147,7 +152,7 @@ Resources:
       ServiceName: !Sub "com.amazonaws.${AWS::Region}.lambda"
       VpcEndpointType: Interface
       SubnetIds: !Ref PrivateSubnetIds
-      SecurityGroupIds: [ !Ref LambdaSecurityGroup ]
+      SecurityGroupIds: [ !Ref VPCEndpointSecurityGroup ]
       PrivateDnsEnabled: true
 
   VPCEndpointSecretsManager:
@@ -157,7 +162,7 @@ Resources:
       ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
       VpcEndpointType: Interface
       SubnetIds: !Ref PrivateSubnetIds
-      SecurityGroupIds: [ !Ref LambdaSecurityGroup ]
+      SecurityGroupIds: [ !Ref VPCEndpointSecurityGroup ]
       PrivateDnsEnabled: true
 
   VPCEndpointLogs:
@@ -167,7 +172,7 @@ Resources:
       ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
       VpcEndpointType: Interface
       SubnetIds: !Ref PrivateSubnetIds
-      SecurityGroupIds: [ !Ref LambdaSecurityGroup ]
+      SecurityGroupIds: [ !Ref VPCEndpointSecurityGroup ]
       PrivateDnsEnabled: true
 
   VPCEndpointKMS:
@@ -177,12 +182,9 @@ Resources:
       ServiceName: !Sub "com.amazonaws.${AWS::Region}.kms"
       VpcEndpointType: Interface
       SubnetIds: !Ref PrivateSubnetIds
-      SecurityGroupIds: [ !Ref LambdaSecurityGroup ]
+      SecurityGroupIds: [ !Ref VPCEndpointSecurityGroup ]
       PrivateDnsEnabled: true
 
-  ################################
-  # Lambdas públicas (sem VPC)
-  ################################
   AnswerBotFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -219,9 +221,37 @@ Resources:
             Auth:
               ApiKeyRequired: true
 
-  ################################
-  # Orchestrator (na VPC privada)
-  ################################
+  ReportStatsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/report-stats/
+      Handler: app.handler
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref PrivateSubnetIds
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+        - Statement:
+            Effect: Allow
+            Action: [ "secretsmanager:GetSecretValue" ]
+            Resource:
+              - !Ref DBPasswordSecret
+              - !Ref DBConnSecret
+      Environment:
+        Variables:
+          PG_PASSWORD_SECRET_ARN: !Ref DBPasswordSecret
+          PG_CONN_SECRET_ARN: !Ref DBConnSecret
+      Events:
+        GetWindow:
+          Type: Api
+          Properties:
+            Path: /reports/window
+            Method: GET
+            RestApiId: !Ref ApiGatewayApi
+            Auth:
+              ApiKeyRequired: true
+
   OrchestratorFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -239,17 +269,16 @@ Resources:
         - AWSLambdaVPCAccessExecutionRole
         - Statement:
             Effect: Allow
-            Action:
-              - secretsmanager:GetSecretValue
-            Resource: !Ref DBPasswordSecret
+            Action: [ "secretsmanager:GetSecretValue" ]
+            Resource:
+              - !Ref DBPasswordSecret
+              - !Ref DBConnSecret
       Environment:
         Variables:
           LAMBDA_GENERATOR_NAME: !Ref AnswerBotFunction
           LAMBDA_PARSER_NAME: !Ref AskBotFunction
-          PG_HOST: !GetAtt PostgresDB.Endpoint.Address
-          PG_PORT: !GetAtt PostgresDB.Endpoint.Port
-          PG_DB: !Ref DBName
-          PG_SECRET_ARN: !Ref DBPasswordSecret
+          PG_PASSWORD_SECRET_ARN: !Ref DBPasswordSecret
+          PG_CONN_SECRET_ARN: !Ref DBConnSecret
       Events:
         PostSimulate:
           Type: Api
